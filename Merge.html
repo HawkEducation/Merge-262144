@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>262144 Squad Merge (Multi-Coop)</title>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        body { background: #121212; color: white; font-family: 'Segoe UI', sans-serif; display: flex; flex-direction: column; align-items: center; min-height: 100vh; margin: 0; padding: 20px; }
+        #ui-top { font-size: 28px; margin-bottom: 10px; color: #00ffcc; font-weight: bold; }
+        #grid { display: grid; grid-template-columns: repeat(4, 100px); grid-template-rows: repeat(4, 100px); grid-gap: 20px; background: #2c2c2c; padding: 20px; border-radius: 15px; border: 4px solid #444; position: relative; }
+        .slot { width: 100px; height: 100px; background: #3d3d3d; border-radius: 12px; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: 0.1s; user-select: none; font-weight: bold; }
+        .selected { outline: 4px solid #00ffcc; background: #2a4a44 !important; transform: scale(1.08); }
+        
+        /* Multi-cursor styling */
+        .ghost-cursor {
+            position: fixed; width: 15px; height: 15px; border-radius: 50%;
+            pointer-events: none; z-index: 9999; border: 2px solid white;
+            transition: transform 0.1s linear;
+        }
+        .cursor-label { position: absolute; top: 18px; font-size: 10px; color: white; background: rgba(0,0,0,0.5); padding: 2px; }
+
+        #connection-panel { background: #1e1e1e; padding: 20px; border-radius: 12px; margin-bottom: 20px; border: 1px solid #333; width: 460px; text-align: center; }
+        .btn { cursor: pointer; font-weight: bold; border: none; border-radius: 5px; padding: 10px 15px; margin: 5px; }
+        .host-btn { background: #007bff; color: white; }
+        .join-btn { background: #00ffcc; color: #121212; }
+        .main-action { background: #00ffcc; color: #121212; padding: 15px 40px; font-size: 20px; border-radius: 10px; margin: 15px; }
+        input { padding: 10px; border-radius: 5px; border: 1px solid #444; background: #000; color: white; width: 70%; }
+    </style>
+</head>
+<body>
+
+    <div id="connection-panel">
+        <div id="setup-ui">
+            <button class="btn host-btn" onclick="startHosting()">Host a Squad</button>
+            <input type="text" id="join-id" placeholder="Enter Squad ID">
+            <button class="btn join-btn" onclick="connectToPeer()">Join Squad</button>
+        </div>
+        <div id="host-ui" style="display:none;">
+            <div id="my-id-display" style="font-size: 18px; color:#00ffcc; margin:10px;"></div>
+            <button class="btn" onclick="copyId()" style="background:#444; color:white;">Copy Squad ID</button>
+        </div>
+        <div id="status">Waiting for players...</div>
+    </div>
+
+    <div id="ui-top">POINTS: <span id="score">0</span></div>
+    <div id="grid"></div>
+    <button class="main-action" onclick="spawnItem()">Spawn Number</button>
+
+    <script>
+        const levels = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144];
+        let board = Array(16).fill(0);
+        let score = 0, spawnIndex = 1, selectedIndex = null;
+        
+        let peer = null;
+        let connections = []; // Array to hold all connected peers (if hosting)
+        let myConn = null;    // The single connection to the host (if joining)
+        let isHost = false;
+
+        // --- MOUSE SYNC ---
+        document.addEventListener('mousemove', (e) => {
+            const data = { type: 'MOUSE', x: e.clientX, y: e.clientY, id: peer ? peer.id : null };
+            if (isHost) {
+                broadcast(data);
+            } else if (myConn && myConn.open) {
+                myConn.send(data);
+            }
+        });
+
+        function broadcast(data) {
+            connections.forEach(c => { if(c.open) c.send(data); });
+            if (data.type !== 'MOUSE') render(); // Re-render for game changes
+        }
+
+        function startHosting() {
+            isHost = true;
+            peer = new Peer();
+            peer.on('open', (id) => {
+                document.getElementById('setup-ui').style.display = 'none';
+                document.getElementById('host-ui').style.display = 'block';
+                document.getElementById('my-id-display').innerText = id;
+            });
+            peer.on('connection', (conn) => {
+                connections.push(conn);
+                setupEvents(conn);
+                document.getElementById('status').innerText = `Players: ${connections.length + 1}`;
+            });
+        }
+
+        function connectToPeer() {
+            const id = document.getElementById('join-id').value;
+            peer = new Peer();
+            peer.on('open', () => {
+                myConn = peer.connect(id);
+                setupEvents(myConn);
+            });
+        }
+
+        function setupEvents(conn) {
+            conn.on('open', () => {
+                document.getElementById('setup-ui').style.display = 'none';
+                if (isHost) conn.send({ type: 'SYNC', board, score });
+            });
+            conn.on('data', (data) => {
+                if (data.type === 'MOUSE') {
+                    updateGhostCursor(data);
+                    if (isHost) broadcast(data); // Relay to other players
+                } else if (data.type === 'SYNC') {
+                    board = data.board; score = data.score; render();
+                } else if (data.type === 'CLICK') {
+                    handleClick(data.index);
+                    if (isHost) broadcast({ type: 'SYNC', board, score });
+                } else if (data.type === 'SPAWN') {
+                    spawnItem(true);
+                    if (isHost) broadcast({ type: 'SYNC', board, score });
+                }
+            });
+        }
+
+        function updateGhostCursor(data) {
+            let cursor = document.getElementById('cursor-' + data.id);
+            if (!cursor && data.id !== peer.id) {
+                cursor = document.createElement('div');
+                cursor.id = 'cursor-' + data.id;
+                cursor.className = 'ghost-cursor';
+                cursor.style.backgroundColor = `hsl(${Math.random() * 360}, 70%, 50%)`;
+                document.body.appendChild(cursor);
+            }
+            if (cursor) {
+                cursor.style.left = data.x + 'px';
+                cursor.style.top = data.y + 'px';
+            }
+        }
+
+        function render() {
+            const grid = document.getElementById('grid');
+            grid.innerHTML = '';
+            board.forEach((val, i) => {
+                const div = document.createElement('div');
+                div.className = 'slot' + (selectedIndex === i ? ' selected' : '');
+                div.innerText = levels[val] || "";
+                div.style.color = val > 0 ? `hsl(${(val * 25) % 360}, 70%, 70%)` : "";
+                div.onclick = () => {
+                    if (isHost) {
+                        handleClick(i);
+                        broadcast({ type: 'SYNC', board, score });
+                    } else if (myConn && myConn.open) {
+                        myConn.send({ type: 'CLICK', index: i });
+                    }
+                };
+                grid.appendChild(div);
+            });
+            document.getElementById('score').innerText = score.toLocaleString();
+        }
+
+        function spawnItem(isRemote = false) {
+            const empty = board.map((v, i) => v === 0 ? i : null).filter(v => v !== null);
+            if (empty.length > 0) {
+                board[empty[Math.floor(Math.random() * empty.length)]] = spawnIndex;
+                if (isHost) broadcast({ type: 'SYNC', board, score });
+                else if (myConn && !isRemote) myConn.send({ type: 'SPAWN' });
+                render();
+            }
+        }
+
+        function handleClick(i) {
+            if (selectedIndex === null) { if (board[i] !== 0) selectedIndex = i; }
+            else if (selectedIndex === i) { selectedIndex = null; }
+            else {
+                if (board[i] === board[selectedIndex] && board[i] !== 0) {
+                    board[i]++; score += levels[board[i]];
+                    board[selectedIndex] = 0; selectedIndex = null;
+                } else { selectedIndex = (board[i] !== 0) ? i : null; }
+            }
+            render();
+        }
+        render();
+        function copyId() { navigator.clipboard.writeText(document.getElementById('my-id-display').innerText); alert("ID Copied!"); }
+    </script>
+</body>
+</html>
